@@ -3114,13 +3114,13 @@ static void remapHistoryRowInto(QRgb* dst, const QRgb* src, int w,
     }
 }
 
-void SpectrumWidget::rebuildWaterfallViewport()
+void SpectrumWidget::rebuildWaterfallViewport(bool callUpdate)
 {
-    rebuildWaterfallViewportForFrame(m_centerMhz, m_bandwidthMhz);
+    rebuildWaterfallViewportForFrame(m_centerMhz, m_bandwidthMhz, callUpdate);
 }
 
 void SpectrumWidget::rebuildWaterfallViewportForFrame(double centerMhz,
-                                                      double bandwidthMhz)
+                                                      double bandwidthMhz, bool callUpdate)
 {
     if (m_waterfall.isNull()) {
         return;
@@ -3131,7 +3131,9 @@ void SpectrumWidget::rebuildWaterfallViewportForFrame(double centerMhz,
     m_wfWriteRow = 0;
 
     if (m_waterfallHistory.isNull()) {
-        update();
+        if (callUpdate) {
+            update();
+        }
         return;
     }
 
@@ -3156,7 +3158,10 @@ void SpectrumWidget::rebuildWaterfallViewportForFrame(double centerMhz,
 #endif
     if (PerfTelemetry::instance().enabled())
         PerfTelemetry::instance().recordWaterfallRebuild();
-    update();
+
+    if (callUpdate) {  
+        update();
+    }
 }
 
 void SpectrumWidget::setWaterfallLive(bool live)
@@ -5923,215 +5928,26 @@ void SpectrumWidget::mouseMoveEvent(QMouseEvent* ev)
         return;
     }
 
-    // TNF drag
-    if (m_draggingTnfId >= 0) {
-        const double newFreq = xToMhz(mx);
-        const int dy = static_cast<int>(ev->position().y()) - m_tnfDragStartPos.y();
-        const double widthScale = std::pow(2.0, static_cast<double>(-dy) / 48.0);
-        const int newWidthHz = std::clamp(
-            static_cast<int>(std::lround(static_cast<double>(m_dragTnfOrigWidthHz) * widthScale)),
-            10, 12000);
-        for (auto& t : m_tnfMarkers) {
-            if (t.id == m_draggingTnfId) {
-                t.freqMhz = newFreq;
-                t.widthHz = newWidthHz;
-                break;
-            }
-        }
-        if (!qFuzzyCompare(newFreq + 1.0, m_dragTnfLastFreq + 1.0)) {
-            m_dragTnfLastFreq = newFreq;
-            emit tnfMoveRequested(m_draggingTnfId, newFreq);
-        }
-        if (newWidthHz != m_dragTnfLastWidthHz) {
-            m_dragTnfLastWidthHz = newWidthHz;
-            emit tnfWidthRequested(m_draggingTnfId, newWidthHz);
-        }
-        m_hoveredTnfId = m_draggingTnfId;
-        m_tuneGuideVisible = false;
-        m_tuneGuideTimer->stop();
-        m_cursorPos = ev->position().toPoint();
-        updateTnfHoverPopup();
-        markOverlayDirty();
-        ev->accept();
-        return;
-    }
+    if (anyDragActive()) {
 
-    if (m_draggingDivider) {
-        // Clamp the divider position: 10%–90% of content area
-        float frac = static_cast<float>(y) / contentH;
-        m_spectrumFrac = std::clamp(frac, 0.10f, 0.90f);
-        // Rebuild waterfall image for new size
-        const int wfHeight = static_cast<int>(contentH * (1.0f - m_spectrumFrac));
-        if (wfHeight > 0 && width() > 0) {
-            QImage newWf(width(), wfHeight, QImage::Format_RGB32);
-            newWf.fill(Qt::black);
-            if (!m_waterfall.isNull()) {
-                QImage scaled = m_waterfall.scaled(width(), wfHeight, Qt::IgnoreAspectRatio, Qt::FastTransformation);
-                if (!scaled.isNull())
-                    newWf = std::move(scaled);
-            }
-            m_waterfall = std::move(newWf);
-            m_wfWriteRow = 0;
-            ensureWaterfallHistory();
-            if (m_wfHistoryRowCount > 0) {
-                rebuildWaterfallViewport();
-            }
-        }
-        positionFpsMeterLabels();
-        markOverlayDirty();
-        ev->accept();
-        return;
-    }
 
-    if (m_draggingDbmRange) {
-        const int dragHeight = std::max(1, specH);
-        const int dy = m_dbmDragStartY - y;
-        const float deltaDb = (static_cast<float>(dy) / dragHeight) * m_dbmDragStartRange;
-        m_dynamicRange = std::max(10.0f, m_dbmDragStartRange + deltaDb);
-        m_refLevel = m_dbmDragStartBottom + m_dynamicRange;
-        markOverlayDirty();
-        ev->accept();
-        return;
-    }
+        const bool isFirstDragEvent = registerDrag(ev->position());
 
-    if (m_draggingDbm) {
-        const int dragHeight = std::max(1, specH);
-        const int dy = y - m_dbmDragStartY;
-        // Convert pixel drag to dB: full FFT height = full dynamic range
-        const float deltaDb = (static_cast<float>(dy) / dragHeight) * m_dynamicRange;
-        m_refLevel = m_dbmDragStartRef + deltaDb;
-        m_refLevel = std::max(m_refLevel, kMinDisplayDbm + m_dynamicRange);
-        markOverlayDirty();
-        ev->accept();
-        return;
-    }
+        // This logic is unique to the current implentation.
+        // Currently drag commits are tied to paintEvent -- i.e. they happen first thing every paintEvent.
+        //
+        // The first time through we allow the drag to commit and schedule an update.
+        // Subsiquent events are just registered until the whole thing resets on the next paintEvent.
+        if(isFirstDragEvent) {
+            commitDrag(true);
 
-    if (m_draggingTimeScaleRate) {
-        const int wfY = specH + DIVIDER_H + freqScaleH();
-        const QRect wfRect(0, wfY, width(), height() - wfY);
-        const QRect timeScaleRect = waterfallTimeScaleRect(wfRect);
-        const int dragHeight = std::max(1, timeScaleRect.height());
-        const int dy = m_timeScaleDragStartY - y;
-        const int rangePct = kWaterfallRatePercentMax - kWaterfallRatePercentMin;
-        const int deltaPct = static_cast<int>(
-            std::round((static_cast<double>(dy) / dragHeight) * rangePct));
-        // Screen Y decreases while dragging up. On the time scale, dragging up
-        // should slow the waterfall, so reduce the rate percent.
-        const int newRatePct = std::clamp(m_timeScaleDragStartRatePercent - deltaPct,
-                                          kWaterfallRatePercentMin,
-                                          kWaterfallRatePercentMax);
-        const int newMs = ratePercentToLineDuration(newRatePct);
-
-        if (newMs != m_wfLineDuration) {
-            emit waterfallLineDurationChangeRequested(newMs);
+            //Set to dirty so that we store subsiquent events.
+            m_dragStateDirty = true;
         }
 
-        setSpectrumCursor(Qt::SizeVerCursor);
         ev->accept();
         return;
-    }
 
-    if (m_draggingTimeScale) {
-        const int wfY = specH + DIVIDER_H + freqScaleH();
-        const QRect wfRect(0, wfY, width(), height() - wfY);
-        const QRect timeScaleRect = waterfallTimeScaleRect(wfRect);
-        const int dragHeight = std::max(1, timeScaleRect.height());
-        const int maxOffset = maxWaterfallHistoryOffsetRows();
-        const int dy = m_timeScaleDragStartY - y;  // pull up = scroll back in time
-        const int deltaRows = (maxOffset > 0)
-            ? static_cast<int>(std::round((static_cast<double>(dy) / dragHeight) * maxOffset))
-            : 0;
-        const int newOffset = std::clamp(m_timeScaleDragStartOffsetRows + deltaRows, 0, maxOffset);
-
-        if (newOffset != m_wfHistoryOffsetRows) {
-            m_wfHistoryOffsetRows = newOffset;
-            if (newOffset > 0) {
-                m_wfLive = false;
-            }
-            rebuildWaterfallViewport();
-            markOverlayDirty();
-        }
-
-        setSpectrumCursor(Qt::SizeVerCursor);
-        ev->accept();
-        return;
-    }
-
-    if (m_draggingBandwidth) {
-        const int dx = static_cast<int>(ev->position().x()) - m_bwDragStartX;
-        // 4x multiplier: dragging 1/4 of widget width doubles/halves bandwidth
-        const double scale = std::pow(2.0, static_cast<double>(-dx) / (width() / 4.0));
-        const double newBw = std::clamp(m_bwDragStartBw * scale, m_minBwMhz, m_maxBwMhz);
-        const double mouseXFrac = static_cast<double>(m_bwDragStartX) / width() - 0.5;
-        const double zoomCenter = std::max(m_bwDragAnchorMhz - mouseXFrac * newBw,
-                                           newBw / 2.0);
-        handleWaterfallFrequencyFrameChange(m_centerMhz, m_bandwidthMhz,
-                                            zoomCenter, newBw);
-        if (!reprojectSpectrum(m_centerMhz, m_bandwidthMhz, zoomCenter, newBw)) {
-            m_bins.clear();
-            m_smoothed.clear();
-        }
-        m_bandwidthMhz = newBw;
-        m_centerMhz = zoomCenter;
-        resetNoiseFloorBaseline();
-        markOverlayDirty();
-        // Keep center and bandwidth coupled while dragging. Sending only the
-        // bandwidth and waiting to send center on release caused the radio and
-        // client waterfall to diverge under trackpad-heavy zoom workflows.
-        emit frequencyRangeChangeRequested(zoomCenter, newBw);
-        ev->accept();
-        return;
-    }
-
-    if (m_draggingFilter != FilterEdge::None) {
-        auto* ao = const_cast<SliceOverlay*>(activeOverlay());
-        if (!ao) { m_draggingFilter = FilterEdge::None; return; }
-        const int mx = static_cast<int>(ev->position().x());
-        // Compute Hz delta from pixel delta — immune to freq/overlay changes (#764)
-        const double hzPerPx = (m_bandwidthMhz * 1.0e6) / width();
-        int hz = m_filterDragStartHz + static_cast<int>(std::round((mx - m_filterDragStartX) * hzPerPx));
-
-        if (m_draggingFilter == FilterEdge::Low) {
-            ao->filterLowHz = hz;
-        } else {
-            ao->filterHighHz = hz;
-        }
-        markOverlayDirty();
-        emit filterChangeRequested(ao->filterLowHz, ao->filterHighHz);
-        ev->accept();
-        return;
-    }
-
-    if (m_draggingVfo) {
-        const int mx = static_cast<int>(ev->position().x());
-        m_vfoDragLastX = mx;
-        // In the edge zone the velocity timer owns panning (keeps the slice
-        // pinned under the cursor); only tune directly when in-window so a
-        // normal drag still tunes live.
-        if (!updateVfoDragEdgePan(mx)) {
-            driveVfoDragTune(mx, "move");
-        }
-        ev->accept();
-        return;
-    }
-
-    if (m_draggingPan) {
-        const int dx = static_cast<int>(ev->position().x()) - m_panDragStartX;
-        // Dragging right moves the view right → center shifts left
-        const double deltaMhz = -(static_cast<double>(dx) / width()) * m_bandwidthMhz;
-        const double newCenter = std::max(m_panDragStartCenter + deltaMhz,
-                                          m_bandwidthMhz / 2.0);
-        handleWaterfallFrequencyFrameChange(m_centerMhz, m_bandwidthMhz,
-                                            newCenter, m_bandwidthMhz);
-        m_centerMhz = newCenter;
-        markOverlayDirty();
-        emit centerChangeRequested(newCenter);
-        if (s_starstruckMode && s_starstruckSound
-            && s_starstruckSound->isLoaded() && !s_starstruckSound->isPlaying()) {
-            s_starstruckSound->play();
-        }
-        ev->accept();
-        return;
     }
 
     // Update cursor based on hover position
@@ -6285,6 +6101,58 @@ void SpectrumWidget::mouseMoveEvent(QMouseEvent* ev)
     }
 }
 
+bool SpectrumWidget::commitDrag(bool callUpdate) {
+    
+    if (m_lastDragPosition.has_value()) {
+
+        handleDrag(*m_lastDragPosition, callUpdate);
+
+        // Invalidate cached position, we just processed the latest
+        m_lastDragPosition = std::nullopt;
+        m_dragStateDirty = false;
+
+        return true; 
+    }
+
+    return false;
+}
+
+bool SpectrumWidget::registerDrag(QPointF position) {
+
+    const bool isFirst = !m_dragStateDirty;
+
+    //Cache mouse position
+    m_lastDragPosition = position;
+    m_dragStateDirty = true;
+
+    return isFirst;
+}
+
+void SpectrumWidget::handleDrag(QPointF position, bool callUpdate) {
+
+    if (m_draggingTnfId >= 0) {
+        handleDraggingTnf(position, callUpdate);
+    } else if (m_draggingDivider) {
+        handleDraggingDivider(position, callUpdate);
+    } else if (m_draggingDbmRange) {
+        handleDraggingDbmRange(position, callUpdate);
+    } else if (m_draggingDbm) {
+        handleDraggingDbm(position, callUpdate);
+    } else if (m_draggingTimeScaleRate) {
+        handleDraggingTimeScaleRate(position, callUpdate);
+    } else if (m_draggingTimeScale) {
+        handleDraggingTimeScale(position, callUpdate);
+    } else if (m_draggingBandwidth) {
+        handleDraggingBandwidth(position, callUpdate);
+    } else if (m_draggingFilter != FilterEdge::None) {
+        handleDraggingFilter(position, callUpdate);
+    } else if (m_draggingVfo) {
+        handleDraggingVfo(position, callUpdate);
+    } else if (m_draggingPan) {
+        handleDraggingPan(position, callUpdate);
+    }
+}
+
 void SpectrumWidget::mouseReleaseEvent(QMouseEvent* ev)
 {
     PerfInputScope perfScope("mouseRelease");
@@ -6293,12 +6161,18 @@ void SpectrumWidget::mouseReleaseEvent(QMouseEvent* ev)
     clearVfoCursorOverride();
 
     if (m_draggingTnfId >= 0) {
+        // End of drag -- Process last position
+        handleDraggingTnf(ev->position(), true);
+
         m_draggingTnfId = -1;
         setSpectrumCursor(Qt::CrossCursor);
         ev->accept();
         return;
     }
     if (m_draggingDivider) {
+        // End of drag -- Process last position
+        handleDraggingDivider(ev->position(), true);
+
         m_draggingDivider = false;
         setSpectrumCursor(Qt::CrossCursor);
         auto& s = AppSettings::instance();
@@ -6311,6 +6185,13 @@ void SpectrumWidget::mouseReleaseEvent(QMouseEvent* ev)
         return;
     }
     if (m_draggingDbm || m_draggingDbmRange) {
+        // End of drag -- Process last position
+        if (m_draggingDbm) {
+            handleDraggingDbm(ev->position(), true);
+        } else if (m_draggingDbmRange) {
+            handleDraggingDbmRange(ev->position(), true);
+        }
+
         const float oldMinDbm = m_draggingDbmRange
             ? m_dbmDragStartBottom
             : std::max(m_dbmDragStartRef - m_dynamicRange, kMinDisplayDbm);
@@ -6338,45 +6219,55 @@ void SpectrumWidget::mouseReleaseEvent(QMouseEvent* ev)
         return;
     }
     if (m_draggingTimeScale) {
+        // End of drag -- Process last position
+        handleDraggingTimeScale(ev->position(), true);
+
         m_draggingTimeScale = false;
         setSpectrumCursor(Qt::CrossCursor);
         ev->accept();
         return;
     }
     if (m_draggingTimeScaleRate) {
+        // End of drag -- Process last position
+        handleDraggingTimeScaleRate(ev->position(), true);
+
         m_draggingTimeScaleRate = false;
         setSpectrumCursor(Qt::CrossCursor);
         ev->accept();
         return;
     }
     if (m_draggingBandwidth) {
+        // End of drag -- Process last position
+        handleDraggingBandwidth(ev->position(), true);
+
         m_draggingBandwidth = false;
         setSpectrumCursor(Qt::CrossCursor);
-        // Re-send the final combined range so the release lands on the same
-        // coherent center/bandwidth pair as the in-flight drag updates.
-        emit frequencyRangeChangeRequested(m_centerMhz, m_bandwidthMhz);
         ev->accept();
         return;
     }
     if (m_draggingVfo) {
+        // End of drag -- Process last position
+        handleDraggingVfo(ev->position(), true);
+
         m_draggingVfo = false;
-        if (m_vfoDragEdgePanTimer)
+        if (m_vfoDragEdgePanTimer) {
             m_vfoDragEdgePanTimer->stop();
+        }
         m_vfoDragEdgeHoldTicks = 0;
         setSpectrumCursor(Qt::CrossCursor);
         ev->accept();
         return;
     }
     if (m_draggingFilter != FilterEdge::None) {
+        // End of drag -- Process last position
+        handleDraggingFilter(ev->position(), true);
+
         m_draggingFilter = FilterEdge::None;
         setSpectrumCursor(Qt::CrossCursor);
         ev->accept();
         return;
     }
     if (m_draggingPan) {
-        m_draggingPan = false;
-        setSpectrumCursor(Qt::CrossCursor);
-        if (s_starstruckSound) s_starstruckSound->stop();
 
         // Single-click-to-tune: if the mouse didn't move during the
         // "pan drag", treat it as a click-to-tune instead
@@ -6390,7 +6281,15 @@ void SpectrumWidget::mouseReleaseEvent(QMouseEvent* ev)
                     emit frequencyClicked(snapToStep(rawMhz, m_stepHz));
                 }
             }
+        } else {
+            // End of drag -- Process last position
+            handleDraggingPan(ev->position(), true);
         }
+
+        m_draggingPan = false;
+        setSpectrumCursor(Qt::CrossCursor);
+        if (s_starstruckSound) s_starstruckSound->stop();
+
         m_spotClickConsumed = false;
         ev->accept();
         return;
@@ -6412,6 +6311,10 @@ void SpectrumWidget::mouseReleaseEvent(QMouseEvent* ev)
         }
     }
     m_spotClickConsumed = false;
+
+    // Invalidate cached drag position
+    m_lastDragPosition = std::nullopt;
+    m_dragStateDirty = false;
 }
 
 void SpectrumWidget::showAddSpotDialog(double freqMhz)
@@ -6548,6 +6451,241 @@ void SpectrumWidget::leaveEvent(QEvent* event)
     m_hoveredSpotKey.clear();
     m_lastTooltipRect = {};
     updateTrackedCursorState(QPoint(-1, -1), false);
+}
+
+void SpectrumWidget::handleDraggingTnf(QPointF position, bool callUpdate) {
+
+    const int mx = static_cast<int>(position.x());
+
+    const double newFreq = xToMhz(mx);
+    const int dy = static_cast<int>(position.y()) - m_tnfDragStartPos.y();
+    const double widthScale = std::pow(2.0, static_cast<double>(-dy) / 48.0);
+    const int newWidthHz = std::clamp(
+        static_cast<int>(std::lround(static_cast<double>(m_dragTnfOrigWidthHz) * widthScale)),
+        10, 12000);
+    for (auto& t : m_tnfMarkers) {
+        if (t.id == m_draggingTnfId) {
+            t.freqMhz = newFreq;
+            t.widthHz = newWidthHz;
+            break;
+        }
+    }
+    if (!qFuzzyCompare(newFreq + 1.0, m_dragTnfLastFreq + 1.0)) {
+        m_dragTnfLastFreq = newFreq;
+        emit tnfMoveRequested(m_draggingTnfId, newFreq);
+    }
+    if (newWidthHz != m_dragTnfLastWidthHz) {
+        m_dragTnfLastWidthHz = newWidthHz;
+        emit tnfWidthRequested(m_draggingTnfId, newWidthHz);
+    }
+    m_hoveredTnfId = m_draggingTnfId;
+    m_tuneGuideVisible = false;
+    m_tuneGuideTimer->stop();
+    m_cursorPos = position.toPoint();
+    updateTnfHoverPopup();
+    markOverlayDirty(callUpdate);
+}
+
+void SpectrumWidget::handleDraggingDivider(QPointF position, bool callUpdate) {
+    const int chromeH  = freqScaleH() + DIVIDER_H;
+    const int contentH = height() - chromeH;
+    const int y = static_cast<int>(position.y());
+
+    // Clamp the divider position: 10%–90% of content area
+    float frac = static_cast<float>(y) / contentH;
+    m_spectrumFrac = std::clamp(frac, 0.10f, 0.90f);
+    // Rebuild waterfall image for new size
+    const int wfHeight = static_cast<int>(contentH * (1.0f - m_spectrumFrac));
+    if (wfHeight > 0 && width() > 0) {
+        QImage newWf(width(), wfHeight, QImage::Format_RGB32);
+        newWf.fill(Qt::black);
+        if (!m_waterfall.isNull()) {
+            QImage scaled = m_waterfall.scaled(width(), wfHeight, Qt::IgnoreAspectRatio, Qt::FastTransformation);
+            if (!scaled.isNull())
+                newWf = std::move(scaled);
+        }
+        m_waterfall = std::move(newWf);
+        m_wfWriteRow = 0;
+        ensureWaterfallHistory();
+        if (m_wfHistoryRowCount > 0) {
+            rebuildWaterfallViewport(callUpdate);
+        }
+    }
+    positionFpsMeterLabels();
+
+    markOverlayDirty(callUpdate);
+}
+
+void SpectrumWidget::handleDraggingDbmRange(QPointF position, bool callUpdate) {
+    const int chromeH = freqScaleH() + DIVIDER_H;
+    const int contentH = height() - chromeH;
+    const int specH = static_cast<int>(contentH * m_spectrumFrac);
+    const int y = static_cast<int>(position.y());
+
+    const int dragHeight = std::max(1, specH);
+    const int dy = m_dbmDragStartY - y;
+    const float deltaDb = (static_cast<float>(dy) / dragHeight) * m_dbmDragStartRange;
+    m_dynamicRange = std::max(10.0f, m_dbmDragStartRange + deltaDb);
+    m_refLevel = m_dbmDragStartBottom + m_dynamicRange;
+    markOverlayDirty(callUpdate);
+}
+
+void SpectrumWidget::handleDraggingDbm(QPointF position, bool callUpdate) {
+    const int chromeH  = freqScaleH() + DIVIDER_H;
+    const int contentH = height() - chromeH;
+    const int specH = static_cast<int>(contentH * m_spectrumFrac);
+    const int y = static_cast<int>(position.y());
+
+    const int dragHeight = std::max(1, specH);
+    const int dy = y - m_dbmDragStartY;
+    // Convert pixel drag to dB: full FFT height = full dynamic range
+    const float deltaDb = (static_cast<float>(dy) / dragHeight) * m_dynamicRange;
+    m_refLevel = m_dbmDragStartRef + deltaDb;
+    m_refLevel = std::max(m_refLevel, kMinDisplayDbm + m_dynamicRange);
+    markOverlayDirty(callUpdate);
+}
+
+void SpectrumWidget::handleDraggingTimeScaleRate(QPointF position, bool callUpdate) {
+    const int chromeH  = freqScaleH() + DIVIDER_H;
+    const int contentH = height() - chromeH;
+    const int specH = static_cast<int>(contentH * m_spectrumFrac);
+    const int y = static_cast<int>(position.y());
+
+
+    const int wfY = specH + DIVIDER_H + freqScaleH();
+    const QRect wfRect(0, wfY, width(), height() - wfY);
+    const QRect timeScaleRect = waterfallTimeScaleRect(wfRect);
+    const int dragHeight = std::max(1, timeScaleRect.height());
+    const int dy = m_timeScaleDragStartY - y;
+    const int rangePct = kWaterfallRatePercentMax - kWaterfallRatePercentMin;
+    const int deltaPct = static_cast<int>(
+        std::round((static_cast<double>(dy) / dragHeight) * rangePct));
+    // Screen Y decreases while dragging up. On the time scale, dragging up
+    // should slow the waterfall, so reduce the rate percent.
+    const int newRatePct = std::clamp(m_timeScaleDragStartRatePercent - deltaPct,
+                                      kWaterfallRatePercentMin,
+                                      kWaterfallRatePercentMax);
+    const int newMs = ratePercentToLineDuration(newRatePct);
+    if (newMs != m_wfLineDuration) {
+        emit waterfallLineDurationChangeRequested(newMs);
+    }
+    setSpectrumCursor(Qt::SizeVerCursor);
+
+    //jbettikTodo: added, confirm this is correct
+    markOverlayDirty(callUpdate);  
+}
+
+void SpectrumWidget::handleDraggingTimeScale(QPointF position, bool callUpdate) {
+    
+    const int chromeH  = freqScaleH() + DIVIDER_H;
+    const int contentH = height() - chromeH;
+    const int specH = static_cast<int>(contentH * m_spectrumFrac);
+    const int y = static_cast<int>(position.y());
+
+    const int wfY = specH + DIVIDER_H + freqScaleH();
+    const QRect wfRect(0, wfY, width(), height() - wfY);
+    const QRect timeScaleRect = waterfallTimeScaleRect(wfRect);
+    const int dragHeight = std::max(1, timeScaleRect.height());
+    const int maxOffset = maxWaterfallHistoryOffsetRows();
+    const int dy = m_timeScaleDragStartY - y;  // pull up = scroll back in time
+    const int deltaRows = (maxOffset > 0)
+        ? static_cast<int>(std::round((static_cast<double>(dy) / dragHeight) * maxOffset))
+        : 0;
+    const int newOffset = std::clamp(m_timeScaleDragStartOffsetRows + deltaRows, 0, maxOffset);
+    if (newOffset != m_wfHistoryOffsetRows) {
+        m_wfHistoryOffsetRows = newOffset;
+        if (newOffset > 0) {
+            m_wfLive = false;
+        }
+        rebuildWaterfallViewport(callUpdate);
+        markOverlayDirty(callUpdate);
+    }
+    setSpectrumCursor(Qt::SizeVerCursor);
+}
+
+void SpectrumWidget::handleDraggingBandwidth(QPointF position, bool callUpdate) {
+
+    const int dx = static_cast<int>(position.x()) - m_bwDragStartX;
+    // 4x multiplier: dragging 1/4 of widget width doubles/halves bandwidth
+    const double scale = std::pow(2.0, static_cast<double>(-dx) / (width() / 4.0));
+    const double newBw = std::clamp(m_bwDragStartBw * scale, m_minBwMhz, m_maxBwMhz);
+    const double mouseXFrac = static_cast<double>(m_bwDragStartX) / width() - 0.5;
+    const double zoomCenter = std::max(m_bwDragAnchorMhz - mouseXFrac * newBw, newBw / 2.0);
+
+    handleWaterfallFrequencyFrameChange(m_centerMhz, m_bandwidthMhz,
+                                        zoomCenter, newBw);
+
+    if (!reprojectSpectrum(m_centerMhz, m_bandwidthMhz, zoomCenter, newBw)) {
+        m_bins.clear();
+        m_smoothed.clear();
+    }
+
+    m_bandwidthMhz = newBw;
+    m_centerMhz = zoomCenter;
+
+    resetNoiseFloorBaseline();
+
+    markOverlayDirty(callUpdate);
+
+    // Keep center and bandwidth coupled while dragging. Sending only the
+    // bandwidth and waiting to send center on release caused the radio and
+    // client waterfall to diverge under trackpad-heavy zoom workflows.
+    emit frequencyRangeChangeRequested(zoomCenter, newBw);
+
+    return;
+}
+
+void SpectrumWidget::handleDraggingFilter(QPointF position, bool callUpdate) {
+
+    auto* ao = const_cast<SliceOverlay*>(activeOverlay());
+    if (!ao) { m_draggingFilter = FilterEdge::None; return; }
+    const int mx = static_cast<int>(position.x());
+    // Compute Hz delta from pixel delta — immune to freq/overlay changes (#764)
+    const double hzPerPx = (m_bandwidthMhz * 1.0e6) / width();
+    int hz = m_filterDragStartHz + static_cast<int>(std::round((mx - m_filterDragStartX) * hzPerPx));
+    if (m_draggingFilter == FilterEdge::Low) {
+        ao->filterLowHz = hz;
+    } else {
+        ao->filterHighHz = hz;
+    }
+    markOverlayDirty(callUpdate);
+    emit filterChangeRequested(ao->filterLowHz, ao->filterHighHz);
+}
+
+void SpectrumWidget::handleDraggingVfo(QPointF position, bool callUpdate) {
+
+    const int mx = static_cast<int>(position.x());
+    m_vfoDragLastX = mx;
+    // In the edge zone the velocity timer owns panning (keeps the slice
+    // pinned under the cursor); only tune directly when in-window so a
+    // normal drag still tunes live.
+    if (!updateVfoDragEdgePan(mx)) {
+        driveVfoDragTune(mx, "move");
+    }
+}
+
+void SpectrumWidget::handleDraggingPan(QPointF position, bool callUpdate) {
+    
+    const int dx = static_cast<int>(position.x()) - m_panDragStartX;
+    // Dragging right moves the view right → center shifts left
+    const double deltaMhz = -(static_cast<double>(dx) / width()) * m_bandwidthMhz;
+    const double newCenter = std::max(m_panDragStartCenter + deltaMhz, m_bandwidthMhz / 2.0);
+
+    handleWaterfallFrequencyFrameChange(m_centerMhz, m_bandwidthMhz,
+                                        newCenter, m_bandwidthMhz);
+
+    m_centerMhz = newCenter;
+
+    markOverlayDirty(callUpdate);
+
+    emit centerChangeRequested(newCenter);
+
+    if (s_starstruckMode && s_starstruckSound && s_starstruckSound->isLoaded() && !s_starstruckSound->isPlaying())
+    {
+        s_starstruckSound->play();
+    }
+    
+    return;
 }
 
 void SpectrumWidget::setLeanMode(bool on)
@@ -8360,6 +8498,12 @@ void SpectrumWidget::render(QRhiCommandBuffer* cb)
         initialize(cb);
         if (!m_rhiInitialized) return;
     }
+
+    // Commit postponed drag if we have one.
+    // If we have one, we want to commit but not schedule another update()
+    // We are already inside a paintEvent
+    commitDrag(false);
+
     renderGpuFrame(cb);
 }
 
@@ -8406,6 +8550,11 @@ void SpectrumWidget::releaseResources()
 void SpectrumWidget::paintEvent(QPaintEvent* ev)
 {
     if (width() <= 0 || height() <= freqScaleH() + DIVIDER_H + 2) return;
+
+    // Commit postponed drag if we have one.
+    // If we have one, we want to commit but not schedule another update()
+    // We are already inside a paintEvent
+    commitDrag(false);
 
 #ifdef AETHER_GPU_SPECTRUM
     // GPU mode: render() handles everything via QRhi. Skip the full

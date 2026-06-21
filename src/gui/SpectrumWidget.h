@@ -630,8 +630,8 @@ private:
     QRect waterfallLiveButtonRect(const QRect& wfRect) const;
     QRect waterfallTimeScaleRect(const QRect& wfRect) const;
     void ensureWaterfallHistory();
-    void rebuildWaterfallViewport();
-    void rebuildWaterfallViewportForFrame(double centerMhz, double bandwidthMhz);
+    void rebuildWaterfallViewport(bool callUpdate = true);
+    void rebuildWaterfallViewportForFrame(double centerMhz, double bandwidthMhz, bool callUpdate = true);
     void setWaterfallLive(bool live);
     void handleWaterfallFrequencyFrameChange(double oldCenterMhz,
                                              double oldBandwidthMhz,
@@ -1236,6 +1236,36 @@ private:
     QPushButton* m_zoomOutBtn{nullptr};
     QPushButton* m_zoomInBtn{nullptr};
 
+    std::optional<QPointF> m_lastDragPosition;  // cached mouse position for delayed drag commits
+    bool m_dragStateDirty{false}; // if we are waiting for drag commit
+
+    /// @brief Commits a postponed drag position if one has been registered. 
+    /// Acts on the existence of m_lastDragPosition, not on the value of m_dragStateDirty
+    /// If true, it commits and resets both variables.
+    /// If false, it doesn't do anything. 
+    /// @param callUpdate true allows commit to call QT update(), false disallows
+    /// @return true if commit occurred, false if not
+    bool commitDrag(bool callUpdate);
+
+    /// @brief Registers a drag position for later commit.
+    /// Sets drag state dirty to true.
+    /// @param position The current drag position
+    /// @return true if this was the first register call on a clean state
+    bool registerDrag(QPointF position);
+
+    void handleDrag(QPointF position, bool callUpdate);
+    void handleDraggingTnf(QPointF position, bool callUpdate);
+    void handleDraggingDivider(QPointF position, bool callUpdate);
+    void handleDraggingDbmRange(QPointF position, bool callUpdate);
+    void handleDraggingDbm(QPointF position, bool callUpdate);
+    void handleDraggingTimeScaleRate(QPointF position, bool callUpdate);
+    void handleDraggingTimeScale(QPointF position, bool callUpdate);
+    void handleDraggingBandwidth(QPointF position, bool callUpdate);
+    void handleDraggingFilter(QPointF position, bool callUpdate);
+    void handleDraggingVfo(QPointF position, bool callUpdate);
+    void handleDraggingPan(QPointF position, bool callUpdate);
+
+
 #ifdef AETHER_GPU_SPECTRUM
     bool m_rhiInitialized{false};
 
@@ -1312,11 +1342,15 @@ private:
 
     // Mark the static overlay for repaint and schedule a frame update.
     // In non-GPU mode this is just update().
-    void markOverlayDirty() {
+    //
+    // jbettick: Default arg `callUpdate` is a temporary measure for partial refactoring
+    void markOverlayDirty(bool callUpdate = true) { 
 #ifdef AETHER_GPU_SPECTRUM
         m_overlayStaticDirty = true;
 #endif
-        update();
+        if(callUpdate) {
+            update();
+        }
     }
 
     void reprojectWaterfall(double oldCenterMhz, double oldBandwidthMhz,
